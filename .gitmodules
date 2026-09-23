@@ -1,0 +1,9 @@
+[submodule "third_party/ROS-TCP-Endpoint"]
+	path = third_party/ROS-TCP-Endpoint
+	url = git@github.com:leggedrobotics/ROS-TCP-Endpoint.git
+[submodule "third_party/brainco-retargeting"]
+	path = third_party/brainco-retargeting
+	url = git@github.com:ronan-lebas/brainco-retargeting.git
+[submodule "third_party/brainco_hand_service"]
+	path = third_party/brainco_hand_service
+	url = git@github.com:unitreerobotics/brainco_hand_service.git

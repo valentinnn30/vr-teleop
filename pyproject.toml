@@ -1,0 +1,28 @@
+[project]
+name = "vr-teleop"
+version = "0.1.0"
+description = "VR teleoperation stack (Quest bridge, retargeting, data collection, hand control) for the G1 + BrainCo hands project. Talks to a GR00T repo's SONIC deploy process over ZMQ; does not contain body-control or sim code."
+requires-python = ">=3.10"
+dependencies = [
+    # Editable path dependency on the GR00T checkout that carries the BrainCo
+    # kinematic patch (URDF/XML/supplemental_info under gear_sonic/data/robot_model,
+    # NOT the STL meshes -- not needed for FK). Swap this path once that patch lives
+    # in its own checkout separate from the GR00T-WholeBodyControl fork.
+    # See docs/ROBOT_TELEOP_QUICKSTART.md and the plan's section D for why this
+    # dependency exists (calibration FK needs the robot's real kinematic chain).
+    "gear_sonic[teleop] @ file:///Users/valentinsimonis/GR00T-WholeBodyControl/gear_sonic",
+]
+
+[project.optional-dependencies]
+# Only needed if data_collection/ is kept -- delete this extra (and the directory)
+# together if data collection turns out not to be needed.
+data_collection = [
+    "gear_sonic[data_collection] @ file:///Users/valentinsimonis/GR00T-WholeBodyControl/gear_sonic",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["quest_bridge*", "retargeting*", "hand_control*", "teleop_manager*", "data_collection*"]
