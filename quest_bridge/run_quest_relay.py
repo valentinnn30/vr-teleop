@@ -9,19 +9,28 @@ its logs, and tear it down cleanly on Ctrl-C.
 The container runs *both* the ROS-TCP endpoint (Quest connects here over the
 Unity ROS-TCP-Connector protocol, launched via roslaunch on a ROS1/Noetic
 master) and the ZMQ relay that republishes the tracking data as a single
-msgpack ``quest_data`` blob. The host-side ``quest_manager_thread_server.py``
-consumes that blob with ``--zmq-relay-host`` (no ROS needed on the host).
+msgpack ``quest_data`` blob. The host-side ``teleop_manager/quest_manager.py``
+consumes that blob with ``--relay-host`` (no ROS needed on the host).
 
 Data flow:
     Quest (Unity) --TCP:10000--> ros_tcp_endpoint --TCPROS--> relay --ZMQ:5559--> manager
 
 Usage (from anywhere in the repo):
-    python gear_sonic_deploy/docker/quest_relay/run_quest_relay.py
-    python gear_sonic_deploy/docker/quest_relay/run_quest_relay.py --rebuild
-    python gear_sonic_deploy/docker/quest_relay/run_quest_relay.py --detach
+    python3 quest_bridge/run_quest_relay.py
+    python3 quest_bridge/run_quest_relay.py --rebuild
+    python3 quest_bridge/run_quest_relay.py --detach
 
 Then, in another shell:
-    python gear_sonic/scripts/quest_manager_thread_server.py --zmq-relay-host localhost
+    python -m teleop_manager.quest_manager --relay-host localhost
+
+Record / replay (off-robot retargeting + latency work):
+    python3 quest_bridge/run_quest_relay.py --record-bag ./bags
+    python3 quest_bridge/run_quest_relay.py --play-bag ./bags/quest_20260929_120000.bag
+
+In --play-bag mode no Quest is involved: the bag supplies the ROS topics the
+endpoint would have published, and the relay itself is unchanged, so the manager
+sees a stream indistinguishable from live. Pair it with the manager's --no-robot
+(there is no deploy to report robot feedback).
 """
 
 import argparse
@@ -33,8 +42,10 @@ import sys
 import time
 from pathlib import Path
 
-# quest_relay -> docker -> gear_sonic_deploy -> <repo root>
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# quest_bridge -> <repo root>. This is the docker build context, and the
+# Dockerfile COPYs from both third_party/ and quest_bridge/, so it must be the
+# repo root and nothing shallower.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = Path(__file__).resolve().parent / "Dockerfile"
 RELAY_PY = Path(__file__).resolve().parent / "relay.py"
 
@@ -85,10 +96,16 @@ def remove_stale_container(name: str) -> None:
     )
 
 
-def stop_container(name: str) -> None:
-    print(f"\n[run_quest_relay] Stopping container '{name}'...")
+def stop_container(name: str, timeout: int = 30) -> None:
+    """Stop the container, giving the entrypoint time to shut its children down.
+
+    `docker stop` defaults to a 10s grace period before SIGKILL. That is enough
+    for the relay, but a rosbag being finalised (index write + .active rename)
+    can need longer, and a SIGKILL there leaves an unreadable bag — so allow more.
+    """
+    print(f"\n[run_quest_relay] Stopping container '{name}' (up to {timeout}s)...")
     subprocess.run(
-        ["docker", "stop", name],
+        ["docker", "stop", "--time", str(timeout), name],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -128,14 +145,48 @@ def network_args(args: argparse.Namespace) -> list[str]:
 
 
 def env_args(args: argparse.Namespace) -> list[str]:
-    """Docker ``-e`` env vars. CAMERA_HOST gates the optional image relay
-    (entrypoint.sh starts image_relay.py only when it is set)."""
-    if args.camera_host is None:
-        return []
-    env = ["-e", f"CAMERA_HOST={args.camera_host}", "-e", f"CAMERA_PORT={args.camera_port}"]
-    if args.image_fps is not None:
-        env += ["-e", f"IMAGE_RELAY_FPS={args.image_fps}"]
+    """Docker ``-e`` env vars. CAMERA_HOST gates the optional image relay, and
+    RECORD_BAG / PLAY_BAG select the rosbag mode (entrypoint.sh branches on all
+    three; each is unset by default)."""
+    # getattr throughout: record_quest_data.py reuses these helpers with a
+    # narrower argument namespace that has neither the camera nor the bag flags.
+    env: list[str] = []
+    if getattr(args, "camera_host", None) is not None:
+        env += ["-e", f"CAMERA_HOST={args.camera_host}", "-e", f"CAMERA_PORT={args.camera_port}"]
+        if args.image_fps is not None:
+            env += ["-e", f"IMAGE_RELAY_FPS={args.image_fps}"]
+    if getattr(args, "record_bag", None) is not None:
+        env += ["-e", "RECORD_BAG=1"]
+        if args.bag_prefix is not None:
+            env += ["-e", f"BAG_PREFIX={args.bag_prefix}"]
+    if getattr(args, "play_bag", None) is not None:
+        # Only the basename crosses into the container; the parent directory is
+        # what gets bind-mounted at /bags (see bag_mount_args).
+        env += ["-e", f"PLAY_BAG={Path(args.play_bag).name}"]
+        if getattr(args, "loop", False):
+            env += ["-e", "BAG_LOOP=1"]
     return env
+
+
+def bag_mount_args(args: argparse.Namespace) -> list[str]:
+    """Bind-mount the bag directory at /bags for whichever rosbag mode is active.
+
+    Recording mounts the target directory (created if missing) read-write;
+    playback mounts the bag's parent directory read-only, so a replay can never
+    clobber the recording it is reading.
+    """
+    record_dir = getattr(args, "record_bag", None)
+    play_bag = getattr(args, "play_bag", None)
+    if record_dir is not None:
+        host_dir = Path(record_dir).expanduser().resolve()
+        host_dir.mkdir(parents=True, exist_ok=True)
+        return ["-v", f"{host_dir}:/bags"]
+    if play_bag is not None:
+        bag_path = Path(play_bag).expanduser().resolve()
+        if not bag_path.is_file():
+            sys.exit(f"[run_quest_relay] ERROR: bag not found: {bag_path}")
+        return ["-v", f"{bag_path.parent}:/bags:ro"]
+    return []
 
 
 def wait_for_zmq(port: int, timeout: float = 60.0) -> bool:
@@ -151,20 +202,28 @@ def wait_for_zmq(port: int, timeout: float = 60.0) -> bool:
 
 
 def print_next_steps(args: argparse.Namespace) -> None:
+    playing = getattr(args, "play_bag", None) is not None
     print("\n" + "=" * 72)
     print("[run_quest_relay] Relay is up.")
-    print(f"  - Point the Quest Unity app at:  <this-host>:{args.tcp_port}")
+    if playing:
+        print(f"  - Replaying bag: {args.play_bag} (no Quest needed)")
+    else:
+        print(f"  - Point the Quest Unity app at:  <this-host>:{args.tcp_port}")
+        if getattr(args, "record_bag", None) is not None:
+            print(f"  - Recording a rosbag into: {args.record_bag}")
+            print("    Stop with Ctrl-C (NOT `docker kill`) so the bag is finalised.")
     print("  - Start the teleop manager with:")
     print(
-        "      python gear_sonic/scripts/quest_manager_thread_server.py "
-        f"--zmq-relay-host localhost --zmq-relay-port {args.zmq_port}"
+        "      python -m teleop_manager.quest_manager "
+        f"--relay-host localhost --relay-port {args.zmq_port}"
+        + ("  --no-robot" if playing else "")
     )
     print("=" * 72 + "\n")
 
 
 def run_detached(tag: str, args: argparse.Namespace) -> int:
     cmd = ["docker", "run", "-d", "--rm", "--name", args.name]
-    cmd += [*network_args(args), *env_args(args), tag, *relay_args(args)]
+    cmd += [*network_args(args), *env_args(args), *bag_mount_args(args), tag, *relay_args(args)]
     result = _run(cmd)
     if result.returncode != 0:
         return result.returncode
@@ -186,7 +245,7 @@ def run_detached(tag: str, args: argparse.Namespace) -> int:
 
 def run_attached(tag: str, args: argparse.Namespace) -> int:
     cmd = ["docker", "run", "--rm", "--name", args.name]
-    cmd += [*network_args(args), *env_args(args), tag, *relay_args(args)]
+    cmd += [*network_args(args), *env_args(args), *bag_mount_args(args), tag, *relay_args(args)]
     print(f"\033[0;34m$ {' '.join(cmd)}\033[0m", flush=True)
     print_next_steps(args)
     print("[run_quest_relay] Starting relay (Ctrl-C to stop)...\n")
@@ -261,7 +320,37 @@ def main() -> int:
     parser.add_argument(
         "--image-fps", type=float, default=None, help="Max image relay publish rate (default 30)."
     )
+    # rosbag record / playback. Recording taps the four ROS topics the relay
+    # consumes; playback feeds them back into an unmodified relay, so the manager
+    # sees the same stream it would live. Mutually exclusive.
+    bag = parser.add_mutually_exclusive_group()
+    bag.add_argument(
+        "--record-bag", default=None, metavar="DIR",
+        help="Record the Quest ROS topics to a rosbag in this host directory "
+             "(created if missing). Live mode only.",
+    )
+    bag.add_argument(
+        "--play-bag", default=None, metavar="BAG",
+        help="Replay this rosbag instead of starting the Quest endpoint (off-robot). "
+             "Pair with the manager's --no-robot.",
+    )
+    parser.add_argument(
+        "--bag-prefix", default=None,
+        help="Filename prefix for --record-bag (default 'quest'); a timestamp is appended.",
+    )
+    parser.add_argument(
+        "--loop", action="store_true", help="With --play-bag, loop the bag forever."
+    )
     args = parser.parse_args()
+
+    if args.loop and args.play_bag is None:
+        parser.error("--loop only applies to --play-bag")
+    if args.bag_prefix is not None and args.record_bag is None:
+        parser.error("--bag-prefix only applies to --record-bag")
+    # Check the bag up front: bag_mount_args() would not run until after the image
+    # build, so a mistyped path would otherwise cost a full build first.
+    if args.play_bag is not None and not Path(args.play_bag).expanduser().is_file():
+        parser.error(f"--play-bag: no such file: {args.play_bag}")
 
     preflight()
 

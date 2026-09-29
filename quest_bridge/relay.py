@@ -4,7 +4,7 @@ Quest ROS1 → ZMQ relay.
 Subscribes to Meta Quest ROS1 topics published via ROS TCP Connector and
 republishes the data as a single msgpack blob over a ZMQ PUB socket.
 
-The host-side QuestReader (in quest_manager_thread_server.py) connects as
+The host-side QuestReader (in teleop_manager/quest_manager.py) connects as
 a ZMQ SUB to consume this data without needing any ROS installation.
 
 ZMQ message format: two-part multipart
@@ -23,7 +23,7 @@ ZMQ message format: two-part multipart
       "timestamp":         float,            # time.time()
   })
 
-Subscribed topics (all configurable via CLI):
+Subscribed topics (/tf is fixed; the other three are CLI-configurable):
   /quest/pose/headset        geometry_msgs/PoseStamped      head pose
   /tf                        tf2_msgs/TFMessage             wrist poses
   /quest/hand_pose/left      vr_haptic_msgs/ManoLandmarks   left hand (21 MANO joints)

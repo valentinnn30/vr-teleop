@@ -1,7 +1,7 @@
 """Robot ego-view camera → Quest, as a ROS1 CompressedImage.
 
 Subscribes (ZMQ SUB + CONFLATE) to the composed camera server's msgpack stream
-(``gear_sonic/camera/sensor_server.py`` ``ImageMessageSchema``), pulls the
+(``data_collection/camera/sensor_server.py`` ``ImageMessageSchema``), pulls the
 ``ego_view`` JPEG **without decoding/re-encoding**, and republishes it as
 ``sensor_msgs/CompressedImage`` (``format="jpeg"``) on a topic ending in
 ``compressed``. The Unity app's ``ImageView`` auto-discovers any such topic and
@@ -9,7 +9,7 @@ can head-lock it, so the operator sees the robot's POV in the headset.
 
 Runs inside the quest_relay container (ROS1 Noetic + roscore from entrypoint.sh),
 started only when ``CAMERA_HOST`` is set. It talks ZMQ to the camera server, so
-it needs neither the gear_sonic package nor any camera SDK — only the on-wire
+it needs neither this repo's Python packages nor any camera SDK — only the on-wire
 msgpack contract, which is:
 
     msgpack({"timestamps": {key: float, ...},

@@ -7,3 +7,6 @@
 [submodule "third_party/brainco_hand_service"]
 	path = third_party/brainco_hand_service
 	url = git@github.com:unitreerobotics/brainco_hand_service.git
+[submodule "third_party/vr_haptic_msgs"]
+	path = third_party/vr_haptic_msgs
+	url = https://github.com/leggedrobotics/vr_haptic_msgs.git

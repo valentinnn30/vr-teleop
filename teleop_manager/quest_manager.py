@@ -44,16 +44,16 @@ Output ("planner" topic, robot ROOT frame, X-forward, Y-left, Z-up):
 
 Usage:
     # Live Quest (relay container must be running, see run_quest_relay.py)
-    python quest_manager_thread_server.py
+    python -m teleop_manager.quest_manager
 
     # Turn in place only, no base translation
-    python quest_manager_thread_server.py --disable-walk
+    python -m teleop_manager.quest_manager --disable-walk
 
     # Static base: only arms/hands move, head/torso fixed at reset pose
-    python quest_manager_thread_server.py --static-base
+    python -m teleop_manager.quest_manager --static-base
 
     # Replay a recorded trajectory (record_quest_data.py NPZ format)
-    python quest_manager_thread_server.py --replay data/quest/traj_xxx.npz
+    python -m teleop_manager.quest_manager --replay data/quest/traj_xxx.npz
 
 Keyboard:
     s          two-stage start (live Quest): 1st press starts the policy and ramps
@@ -81,6 +81,7 @@ Keyboard:
 from __future__ import annotations
 
 import argparse
+import csv
 import queue
 import select
 import sys
@@ -877,6 +878,91 @@ class KeyboardListener:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_term)
 
 
+class LatencyTrace:
+    """Per-frame CSV trace of the teleop path, for offline latency work.
+
+    One row per planner message actually sent (i.e. full teleop frames only), so
+    every row describes a complete relay -> manager -> retarget -> send chain.
+
+    What this can and cannot measure. The relay stamps each snapshot with its own
+    ``time.time()`` at ROS callback receipt, and relay and manager are always
+    co-located (both on the Jetson live; both on the laptop under rosbag
+    playback), so the wall-clock deltas below are free of clock skew. But the
+    Quest sends zero ROS header stamps and the ROS-TCP-Endpoint fork restamps
+    with robot-side receipt time, so NOTHING here includes headset->robot
+    transport. A small ``age_recv_ms`` means the robot-side pipeline is fine and
+    any remaining lag is in the Quest link, which needs a Unity-side capture
+    stamp to see.
+
+    Under ``--replay`` the payload timestamp is media-relative rather than wall
+    clock, so the columns derived from it are written empty instead of wrong.
+    """
+
+    COLUMNS = (
+        "frame_idx",      # sequential index of sent planner frames
+        "relay_ts",       # wall clock stamped by the relay (blank if not meaningful)
+        "recv_ts",        # wall clock when the manager read the frame
+        "age_recv_ms",    # relay publish -> manager read
+        "retarget_ms",    # manager read -> hand retargeting done
+        "send_ms",        # retargeting done -> planner message sent
+        "loop_ms",        # manager read -> planner message sent
+        "total_ms",       # relay publish -> planner message sent
+    )
+
+    def __init__(self, path: str, relay_ts_meaningful: bool):
+        self._relay_ts_meaningful = relay_ts_meaningful
+        self._fh = open(path, "w", newline="")
+        self._writer = csv.writer(self._fh)
+        self._writer.writerow(self.COLUMNS)
+        self._idx = 0
+        # Flushing every row would put a filesystem write in the 50 Hz control
+        # loop; flush on a timer instead so a crash still leaves ~1s of data.
+        self._last_flush = time.monotonic()
+        print(f"[QuestManager] Latency trace -> {path}")
+        if not relay_ts_meaningful:
+            print("[QuestManager]   (replay: relay_ts/age_recv_ms/total_ms left blank)")
+
+    @staticmethod
+    def _ms(later: float, earlier: float) -> str:
+        return f"{(later - earlier) * 1000.0:.3f}"
+
+    def row(
+        self,
+        relay_ts: float,
+        recv_wall: float,
+        recv_mono: float,
+        retarget_mono: float,
+        send_mono: float,
+    ) -> None:
+        usable = self._relay_ts_meaningful and relay_ts > 0.0
+        send_wall = recv_wall + (send_mono - recv_mono)
+        self._writer.writerow(
+            (
+                self._idx,
+                f"{relay_ts:.6f}" if usable else "",
+                f"{recv_wall:.6f}",
+                self._ms(recv_wall, relay_ts) if usable else "",
+                self._ms(retarget_mono, recv_mono),
+                self._ms(send_mono, retarget_mono),
+                self._ms(send_mono, recv_mono),
+                self._ms(send_wall, relay_ts) if usable else "",
+            )
+        )
+        self._idx += 1
+        now = time.monotonic()
+        if now - self._last_flush >= 1.0:
+            self._fh.flush()
+            self._last_flush = now
+
+    def close(self) -> None:
+        try:
+            self._fh.flush()
+            self._fh.close()
+            print(f"[QuestManager] Latency trace closed ({self._idx} frames)")
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Manager loop
 # ---------------------------------------------------------------------------
@@ -902,6 +988,22 @@ class QuestManager:
             )
         else:
             self.source = LiveQuestSource(args.relay_host, args.relay_port)
+
+        # "Offline" = there is no deploy publishing g1_debug, so nothing can tell
+        # us the robot's measured pose and the pre-teleop ramp is meaningless.
+        # True for --replay, and for --no-robot with a live source (the relay in
+        # rosbag playback mode, which looks live but has no robot behind it).
+        self.offline = self.source.is_replay or bool(args.no_robot)
+        if self.offline and not self.source.is_replay:
+            print("[QuestManager] --no-robot: skipping the ramp and robot feedback")
+
+        # relay_ts is wall clock only for a live relay; ReplaySource timestamps are
+        # media-relative, so the trace blanks the columns derived from them.
+        self.latency_trace = (
+            LatencyTrace(args.latency_csv, relay_ts_meaningful=not self.source.is_replay)
+            if args.latency_csv
+            else None
+        )
 
         self.ctx = zmq.Context()
         self.pub = self.ctx.socket(zmq.PUB)
@@ -1146,8 +1248,11 @@ class QuestManager:
         if key == "q":
             return True, False, False
         elif key == "s":
-            if self.source.is_replay:
-                # Replay has no robot to ramp; single press starts teleop.
+            if self.offline:
+                # No robot to ramp from (replay, or --no-robot against a bag):
+                # single press starts teleop. _arm_calibration still keeps the
+                # countdown for a live source — only replay has a synthetic rest
+                # prefix that makes a countdown pointless.
                 if self.phase == PHASE_OFF:
                     self._arm_calibration("start")
                 else:
@@ -1162,8 +1267,9 @@ class QuestManager:
             else:
                 print("[QuestManager] Already started ('r' to recalibrate, 'q' to stop)")
         elif key == "r":
-            if self.source.is_replay:
-                # Replay has no operator to re-settle; recalibrate immediately.
+            if self.offline:
+                # No robot to ease back to the reference pose; recalibrate
+                # immediately against the current frame.
                 if self.phase == PHASE_TELEOP:
                     self._arm_calibration("recalib")
                 else:
@@ -1402,6 +1508,8 @@ class QuestManager:
                     break
 
                 frame = self.source.get_frame()
+                t_recv_mono = time.monotonic()
+                t_recv_wall = time.time()
                 # End-to-end frame age at the manager input. Only meaningful for
                 # a live relay (its timestamp is relay wall-clock time.time());
                 # replay timestamps are media-relative, so skip them.
@@ -1427,6 +1535,7 @@ class QuestManager:
                     self._last_compute_t = t_start
                     pos, quat = self.pose_filter(pos, quat, dt)
                     hands = self._compute_hands(frame)
+                    t_retarget_mono = time.monotonic()
                     pos, quat, facing_yaw, hands, head_drop = self._apply_pause_resume(
                         pos, quat, yaw_rel, hands, head_drop
                     )
@@ -1460,6 +1569,14 @@ class QuestManager:
                         )
                     )
                     sent += 1
+                    if self.latency_trace is not None:
+                        self.latency_trace.row(
+                            relay_ts=float(frame.get("timestamp", 0.0)),
+                            recv_wall=t_recv_wall,
+                            recv_mono=t_recv_mono,
+                            retarget_mono=t_retarget_mono,
+                            send_mono=time.monotonic(),
+                        )
 
                 self.pub.send(
                     pack_pose_message(
@@ -1521,6 +1638,8 @@ class QuestManager:
         time.sleep(0.1)
 
     def close(self) -> None:
+        if self.latency_trace is not None:
+            self.latency_trace.close()
         self.source.close()
         self.pub.close()
         self.ctx.term()
@@ -1671,6 +1790,23 @@ def main() -> None:
     )
     parser.add_argument(
         "--replay", default=None, help="NPZ trajectory to replay instead of live Quest"
+    )
+    parser.add_argument(
+        "--latency-csv",
+        default=None,
+        metavar="PATH",
+        help="write a per-frame latency trace (one row per planner frame sent) to "
+        "this CSV. Covers relay->manager->retarget->send; it cannot include the "
+        "Quest->robot hop, which carries no capture timestamp. Works live, under "
+        "--replay (relay-derived columns blank), and under rosbag playback.",
+    )
+    parser.add_argument(
+        "--no-robot",
+        action="store_true",
+        help="no deploy is running: skip the pre-teleop ramp and the g1_debug "
+        "feedback wait, so 's' calibrates immediately. Use with a live relay that "
+        "has no robot behind it — notably rosbag playback "
+        "(run_quest_relay.py --play-bag). Implied by --replay.",
     )
     parser.add_argument(
         "--rest-hold-sec",

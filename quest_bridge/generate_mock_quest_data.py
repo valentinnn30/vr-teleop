@@ -40,13 +40,13 @@ Everything is deterministic given ``--seed``: trajectory ``i`` uses ``seed + i``
 so re-running reproduces byte-identical motion (modulo the filename timestamp).
 
 Usage (from anywhere in the repo):
-    python gear_sonic_deploy/docker/quest_relay/generate_mock_quest_data.py
-    python gear_sonic_deploy/docker/quest_relay/generate_mock_quest_data.py \
+    python3 quest_bridge/generate_mock_quest_data.py
+    python3 quest_bridge/generate_mock_quest_data.py \
         --output-dir data/quest --num-trajectories 5 --duration 17 --hz 90 --seed 0
 
     # Crouch test motion for the manager's head-height -> planner height command
-    # (opt-in style; replay it with quest_manager_thread_server.py --replay):
-    python gear_sonic_deploy/docker/quest_relay/generate_mock_quest_data.py \
+    # (opt-in style; replay it with quest_manager.py --replay):
+    python3 quest_bridge/generate_mock_quest_data.py \
         --styles crouch --num-trajectories 1 --duration 24 --output-dir data/quest/mock
 """
 

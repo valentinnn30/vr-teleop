@@ -31,8 +31,8 @@ stacked arrays (T = number of frames):
 plus string metadata (hz, topics, wall-clock start/stop).
 
 Usage (from anywhere in the repo):
-    python gear_sonic_deploy/docker/quest_relay/record_quest_data.py
-    python gear_sonic_deploy/docker/quest_relay/record_quest_data.py --output-dir /data/quest --rebuild
+    python3 quest_bridge/record_quest_data.py
+    python3 quest_bridge/record_quest_data.py --output-dir /data/quest --rebuild
 
 Frames arrive at the relay ``--hz`` rate regardless of whether the underlying
 topics changed, so consecutive frames may repeat values; pass ``--dedupe`` to
