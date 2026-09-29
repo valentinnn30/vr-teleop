@@ -33,6 +33,16 @@ Output ("planner" topic, robot ROOT frame, X-forward, Y-left, Z-up):
                        only turns in place via facing). --static-base goes
                        further: no walk AND facing pinned to neutral, so the
                        base stays put and only the arms/hands move.
+
+    Head anchor: whenever the base cannot translate (--static-base or
+    --disable-walk, and --static-base is the launcher default) the wrist targets
+    are measured from the head position captured at CALIBRATION, not the live
+    one, so they depend only on how far the operator's hands have moved since
+    then and head motion does not move the arms — the robot has no commandable
+    neck to reproduce it with. With walking enabled the live (head-relative)
+    form is required instead, or the targets would extend by the distance the
+    operator walked. --live-head-frame forces the live form for A/B.
+
     mode + height      crouch: the operator's head DROP below the calibration
                        height (plus the '-'/'=' keyboard trim) commands an
                        IDEL_SQUAT with a target base height. Independent of
@@ -84,6 +94,7 @@ import argparse
 import csv
 import queue
 import select
+import subprocess
 import sys
 import termios
 import threading
@@ -356,16 +367,17 @@ class QuestThreePointTracker:
       - R0 = Rz(head yaw): the operator's heading frame at calibration. All
         runtime quantities are expressed in this fixed frame, which is taken
         to coincide with the robot root frame.
-      - v_cal = R0^-1 (p_wrist - p_head): the head->wrist offset vector. Using
-        the head-relative delta (rather than absolute wrist position) makes
-        tracking invariant to the operator walking or leaning.
+      - p_head_cal: the operator's head position, kept as the anchor the wrist
+        targets are measured from (see lock_head_anchor below).
+      - v_cal = R0^-1 (p_wrist - p_head_cal): the head->wrist offset vector.
       - W_cal: operator wrist orientation. Captures the (unknown, fixed)
         Quest-hand-frame vs robot-wrist-frame convention offset.
       - (link_ref, R_ref): robot wrist LINK pose from FK — the robot pose that
         the operator's rest pose maps onto.
 
-    Runtime, per wrist, with Rh(t) = Rz(head_yaw(t)) the CURRENT heading frame:
-        v(t)    = Rh(t)^-1 (p_wrist(t) - p_head(t))
+    Runtime, per wrist, with Rh(t) = Rz(head_yaw(t)) the CURRENT heading frame
+    and p_ref the head anchor (p_head_cal when locked, p_head(t) when not):
+        v(t)    = Rh(t)^-1 (p_wrist(t) - p_ref)
         link(t) = link_ref + pos_scale * (v(t) - v_cal)
         R(t)    = Rh(t)^-1 W(t) W_cal^-1 R0 * R_ref       (world-frame delta)
         sent(t) = link(t) + R(t) @ key_frame_offset
@@ -375,6 +387,33 @@ class QuestThreePointTracker:
     R(t) are unchanged, so the arms do not chase the rotation. The rotation
     itself is returned as yaw_rel and must be sent as the planner ``facing``
     command, which makes the robot's whole body turn to follow the operator.
+
+    The head anchor (lock_head_anchor, the default when the base is pinned):
+    p_ref stays at p_head_cal, so v(t) - v_cal collapses to
+    R^-1 (p_wrist(t) - p_wrist_cal) and the targets depend ONLY on how far the
+    operator's hands have moved since calibration. The robot has no commandable
+    neck, so head motion cannot be reproduced; with the live p_head(t) it leaks
+    into the arms instead and merely looking around or leaning in commands them.
+    Both forms agree exactly at the calibration instant (p_ref == p_head_cal
+    there either way), so v_cal and the ramp -> teleop handoff are unaffected.
+
+    p_ref = p_head(t) is required as soon as the base can TRANSLATE: if the robot
+    walks because the operator walked, the operator's wrists advanced too, and an
+    absolute anchor would extend the targets by the distance walked instead of
+    holding the hands in front of the chest. Hence the manager only locks the
+    anchor when walking is off.
+
+    The anchor is orthogonal to turning in place, and does not change it: with the
+    live heading frame (--disable-walk, facing still live) an operator body-turn
+    rotates the wrists about an axis through the head and Rh(t)^-1 cancels it, so
+    the targets stay put in both anchor modes; under --static-base facing is
+    pinned, the robot cannot turn, and a body-turn is therefore just hand motion
+    that the targets follow — again identically in both modes.
+
+    This relies on the Quest publishing wrist positions in the same fixed
+    tracking frame as the head pose, not relative to the head. It does: the
+    relay's /tf wrist transforms and /quest/pose/headset share that frame, which
+    is what makes p_wrist - p_head meaningful in the first place.
 
     The world-frame delta makes R(t) independent of the Quest hand-frame
     convention: any fixed offset C in W = W_physical * C cancels in
@@ -416,6 +455,7 @@ class QuestThreePointTracker:
         robot_ref: RobotRestReference,
         pos_scale: float = 0.8,
         static_base: bool = False,
+        lock_head_anchor: bool = False,
     ):
         self._robot_ref = robot_ref
         self.pos_scale = float(pos_scale)
@@ -427,6 +467,11 @@ class QuestThreePointTracker:
         # the robot to cancel that rotation; with static_base facing is pinned,
         # so the rotation must be removed here instead.
         self.static_base = bool(static_base)
+        # Measure the wrist targets from the head position captured at
+        # calibration rather than the live one, so head motion — which the robot
+        # cannot reproduce, having no commandable neck — does not move the arms.
+        # Only valid while the base cannot translate; see the class docstring.
+        self.lock_head_anchor = bool(lock_head_anchor)
         self._calibrated = False
         self._yaw_cal = 0.0
         self._r0 = sRot.identity()
@@ -436,7 +481,12 @@ class QuestThreePointTracker:
         self._link_ref: dict[str, np.ndarray] = {}
         self._rot_ref: dict[str, sRot] = {}
         self._torso_pos = np.zeros(3)
+        self._head_pos_cal = np.zeros(3)
         self._head_z_cal = 0.0
+        # Planar distance from the anchor, for the manager's drift warning. Only
+        # meaningful while locked; z is excluded so a deliberate crouch does not
+        # read as drift (head height is the crouch channel's business).
+        self._head_drift = 0.0
         # Head planar velocity tracking (R0 frame), reset on each calibration.
         self._prev_head_pos: np.ndarray | None = None
         self._prev_ts: float | None = None
@@ -447,6 +497,11 @@ class QuestThreePointTracker:
     def is_calibrated(self) -> bool:
         return self._calibrated
 
+    @property
+    def head_drift(self) -> float:
+        """Planar distance (m) of the live head from the calibration anchor."""
+        return self._head_drift
+
     def calibrate(self, frame: dict, body_q_29: np.ndarray | None = None) -> None:
         """Capture calibration from one Quest frame against the robot FK reference."""
         fk = self._robot_ref.compute(body_q_29)
@@ -455,7 +510,11 @@ class QuestThreePointTracker:
         self._r0_inv = self._r0.inv()
 
         head_pos = np.asarray(frame["head_pos"], dtype=np.float64)
+        # The full vector, not just z: it is the anchor compute() measures the
+        # wrist targets from when lock_head_anchor is set.
+        self._head_pos_cal = head_pos.copy()
         self._head_z_cal = float(head_pos[2])
+        self._head_drift = 0.0
         for side in _SIDES:
             wrist_pos = np.asarray(frame[f"{side}_wrist_pos"], dtype=np.float64)
             self._v_cal[side] = self._r0_inv.apply(wrist_pos - head_pos)
@@ -469,9 +528,10 @@ class QuestThreePointTracker:
         self._calibrated = True
 
         src = "default rest pose" if body_q_29 is None else "measured robot joints"
+        anchor = "locked head anchor" if self.lock_head_anchor else "live head frame"
         print(
             f"[QuestManager] Calibration captured (FK ref: {src}, head yaw "
-            f"{np.degrees(self._yaw_cal):+.1f} deg)"
+            f"{np.degrees(self._yaw_cal):+.1f} deg, {anchor})"
         )
         for side in _SIDES:
             v = self._v_cal[side]
@@ -561,10 +621,17 @@ class QuestThreePointTracker:
         quat = np.zeros((3, 4), dtype=np.float64)
         head_pos = np.asarray(frame["head_pos"], dtype=np.float64)
         self._update_head_velocity(head_pos, float(frame["timestamp"]))
+        self._head_drift = float(np.linalg.norm((head_pos - self._head_pos_cal)[:2]))
+        # The anchor the wrist targets are measured from. Locked: the calibration
+        # head position, so v - v_cal is purely the hands' displacement since
+        # calibration and head motion moves nothing. Unlocked: the live head, which
+        # keeps the targets invariant to the operator walking (needed once the base
+        # can translate) at the cost of head motion driving the arms.
+        p_ref = self._head_pos_cal if self.lock_head_anchor else head_pos
 
         for i, side in enumerate(_SIDES):
             wrist_pos = np.asarray(frame[f"{side}_wrist_pos"], dtype=np.float64)
-            v = rh_inv.apply(wrist_pos - head_pos)
+            v = rh_inv.apply(wrist_pos - p_ref)
             link = self._link_ref[side] + self.pos_scale * (v - self._v_cal[side])
 
             w = _rot(frame[f"{side}_wrist_quat"])
@@ -972,8 +1039,18 @@ class QuestManager:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.robot_ref = RobotRestReference()
+        # Lock the head anchor whenever the base cannot translate, which is the
+        # launcher's default (MANAGER_EXTRA=--static-base). With walking enabled the
+        # targets must stay head-relative or they would extend by the distance the
+        # operator walked — see QuestThreePointTracker's docstring.
+        self.lock_head_anchor = bool(
+            (args.static_base or args.disable_walk) and not args.live_head_frame
+        )
         self.tracker = QuestThreePointTracker(
-            self.robot_ref, pos_scale=args.pos_scale, static_base=args.static_base
+            self.robot_ref,
+            pos_scale=args.pos_scale,
+            static_base=args.static_base,
+            lock_head_anchor=self.lock_head_anchor,
         )
         self.pose_filter = PoseLowPass(args.smooth_tau)
         self.retargeter = FingerRetargeting(force_np=args.np_retarget)
@@ -994,8 +1071,23 @@ class QuestManager:
         # True for --replay, and for --no-robot with a live source (the relay in
         # rosbag playback mode, which looks live but has no robot behind it).
         self.offline = self.source.is_replay or bool(args.no_robot)
+        # Bag replay: the second 's' starts the recording and the first frame it
+        # produces becomes the calibration reference, so the bag plays out relative
+        # to the pose the robot ramped to on the first 's'.
+        self._await_bag_frame = False
         if self.offline and not self.source.is_replay:
             print("[QuestManager] --no-robot: skipping the ramp and robot feedback")
+        if self.lock_head_anchor:
+            print(
+                "[QuestManager] Head anchor LOCKED at calibration — head motion does "
+                "not move the arms"
+            )
+        else:
+            print(
+                "[QuestManager] Head frame LIVE — wrist targets are head-relative, so "
+                "head motion moves the arms"
+                + (" (--live-head-frame)" if args.live_head_frame else " (base can walk)")
+            )
 
         # relay_ts is wall clock only for a live relay; ReplaySource timestamps are
         # media-relative, so the trace blanks the columns derived from them.
@@ -1071,6 +1163,27 @@ class QuestManager:
         self.resume_rebase_pending = False
 
     # -- calibration triggers -------------------------------------------------
+
+    def _start_bag(self) -> None:
+        """Second 's' in bag-replay mode: start the recording, calibrate on frame 1.
+
+        Calibration is deferred rather than taken now because until the bag plays
+        something the relay is republishing its default all-zero snapshot, and
+        anchoring to that would map the whole recording onto a meaningless
+        reference. Taking the bag's own first frame instead makes it play out
+        relative to the calibration pose the robot just ramped to.
+        """
+        if self._await_bag_frame:
+            print("[QuestManager] Bag already starting...")
+            return
+        print(f"[QuestManager] Starting bag playback: {self.args.bag_trigger}")
+        try:
+            subprocess.Popen(self.args.bag_trigger, shell=True)
+        except Exception as e:  # noqa: BLE001 - report, do not mask
+            print(f"[QuestManager] ERROR: could not start the bag: {e}")
+            return
+        self._await_bag_frame = True
+        print("[QuestManager] Calibrating on the recording's first frame...")
 
     def _arm_calibration(self, kind: str) -> None:
         if self.source.is_replay:
@@ -1253,17 +1366,24 @@ class QuestManager:
                 # single press starts teleop. _arm_calibration still keeps the
                 # countdown for a live source — only replay has a synthetic rest
                 # prefix that makes a countdown pointless.
-                if self.phase == PHASE_OFF:
-                    self._arm_calibration("start")
-                else:
+                if self.phase != PHASE_OFF:
                     print("[QuestManager] Already started ('q' to stop)")
+                elif self.args.bag_trigger:
+                    # Off-robot bag replay: there is no ramp to hang the trigger
+                    # off, so this single press both starts the recording and
+                    # calibrates on its first frame.
+                    self._start_bag()
+                else:
+                    self._arm_calibration("start")
             elif self.phase == PHASE_OFF:
                 self._begin_calib_ramp()
             elif self.phase == PHASE_RAMP:
-                if self.ramp_started:
-                    self._arm_calibration("start")
-                else:
+                if not self.ramp_started:
                     print("[QuestManager] Waiting for robot feedback before calibrating...")
+                elif self.args.bag_trigger:
+                    self._start_bag()
+                else:
+                    self._arm_calibration("start")
             else:
                 print("[QuestManager] Already started ('r' to recalibrate, 'q' to stop)")
         elif key == "r":
@@ -1526,6 +1646,17 @@ class QuestManager:
                         lat_n += 1
                 self._update_countdown(frame)
 
+                # The relay's default snapshot carries timestamp 0.0 and only gets
+                # a real one once a ROS message lands, so this is exactly "the
+                # recording has produced its first frame".
+                if (
+                    self._await_bag_frame
+                    and frame is not None
+                    and float(frame.get("timestamp", 0.0)) > 0.0
+                ):
+                    self._await_bag_frame = False
+                    self._do_calibration("start", frame)
+
                 if self.phase == PHASE_RAMP:
                     if self._run_ramp():
                         sent += 1
@@ -1613,6 +1744,22 @@ class QuestManager:
                         )
                     )
                     crouch = "off" if self._height_cmd < 0.0 else f"{self._height_cmd:.2f}"
+                    # Locked anchor: the operator's own drift is no longer cancelled,
+                    # so if they have wandered from where they calibrated, say so and
+                    # name the remedy. Warning only — nothing commanded changes.
+                    if not self.lock_head_anchor:
+                        anchor = " | anchor=live"
+                    elif (
+                        self.args.anchor_drift_warn > 0.0
+                        and self.tracker.is_calibrated
+                        and self.tracker.head_drift > self.args.anchor_drift_warn
+                    ):
+                        anchor = (
+                            f" | anchor=locked drift {self.tracker.head_drift:.2f}m"
+                            " — press 'r' to re-anchor"
+                        )
+                    else:
+                        anchor = " | anchor=locked"
                     latency = (
                         f" | frame-age avg={1e3 * lat_sum / lat_n:.0f}ms "
                         f"max={1e3 * lat_max:.0f}ms"
@@ -1623,7 +1770,7 @@ class QuestManager:
                         f"[QuestManager] {state} | quest={data} | "
                         f"{sent / (now - last_report):.1f} planner msg/s | "
                         f"fingers={'on' if self.finger_tracking else 'off'} | "
-                        f"walk={walk} | crouch={crouch}{latency}"
+                        f"walk={walk} | crouch={crouch}{anchor}{latency}"
                     )
                     last_report = now
                     lat_sum, lat_max, lat_n = 0.0, 0.0, 0
@@ -1709,7 +1856,25 @@ def main() -> None:
         action="store_true",
         help="freeze the robot base: only arms/hands move, the head/torso stays at "
         "its reset pose (no walking AND no turn-in-place). Implies --disable-walk "
-        "and forces facing to neutral. Operator should keep head motion limited.",
+        "and forces facing to neutral. Also locks the head anchor, so head motion "
+        "does not move the arms.",
+    )
+    parser.add_argument(
+        "--live-head-frame",
+        action="store_true",
+        help="keep the wrist targets head-RELATIVE instead of anchoring them to the "
+        "calibration head position: head motion then moves the arms, as it did "
+        "before the anchor existed. Only has an effect when the base is pinned "
+        "(--static-base / --disable-walk), since with walking enabled the "
+        "head-relative form is used regardless. For A/B on hardware.",
+    )
+    parser.add_argument(
+        "--anchor-drift-warn",
+        type=float,
+        default=0.15,
+        help="warn in the status line once the operator's head is this far (m, "
+        "planar) from the locked anchor, since their own drift is no longer "
+        "cancelled and the fix is to re-anchor with 'r'. 0 disables the warning",
     )
     parser.add_argument(
         "--walk-mode",
@@ -1790,6 +1955,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--replay", default=None, help="NPZ trajectory to replay instead of live Quest"
+    )
+    parser.add_argument(
+        "--bag-trigger",
+        default=None,
+        metavar="CMD",
+        help="shell command that starts bag playback, run when the second 's' is "
+        "pressed. Calibration is then taken from the recording's first frame, so "
+        "the bag plays out relative to the pose the first 's' ramped to. Set by "
+        "scripts/launch_robot_side.sh when PLAY_BAG is used.",
     )
     parser.add_argument(
         "--latency-csv",

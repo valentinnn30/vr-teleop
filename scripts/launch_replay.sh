@@ -124,7 +124,8 @@ manager_cmd() {
         c+=(--replay "$NPZ")
     else
         # Live source with no deploy behind it: skip the ramp + feedback wait.
-        c+=(--relay-host localhost --relay-port "$ZMQ_PORT" --no-robot)
+        c+=(--relay-host localhost --relay-port "$ZMQ_PORT" --no-robot
+            --bag-trigger "docker exec quest-relay /start_bag.sh")
     fi
     printf '%q ' "${c[@]}"
     # `if` rather than `[ ... ] && ...`: the latter returns non-zero when

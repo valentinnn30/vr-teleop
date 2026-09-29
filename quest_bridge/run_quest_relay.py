@@ -34,6 +34,7 @@ sees a stream indistinguishable from live. Pair it with the manager's --no-robot
 """
 
 import argparse
+import hashlib
 import shutil
 import signal
 import socket
@@ -52,6 +53,61 @@ RELAY_PY = Path(__file__).resolve().parent / "relay.py"
 # Container-internal ports (fixed; see Dockerfile EXPOSE and relay.py defaults).
 CONTAINER_TCP_PORT = 10000
 CONTAINER_ZMQ_PORT = 5559
+
+# Everything baked into the image. Docker's own layer cache cannot help us decide
+# whether to rebuild, because we only ever ask "does this tag exist?" — so an
+# edited entrypoint.sh would otherwise sit unused behind an image that already
+# exists. We stamp a fingerprint of these inputs as a label at build time and
+# compare it before each run.
+IMAGE_SOURCES = (
+    "Dockerfile",
+    "entrypoint.sh",
+    "relay.py",
+    "image_relay.py",
+    "endpoint_no_adb.launch",
+)
+IMAGE_SUBMODULES = ("third_party/ROS-TCP-Endpoint", "third_party/vr_haptic_msgs")
+FINGERPRINT_LABEL = "vr_teleop.fingerprint"
+
+
+def image_fingerprint() -> str:
+    """Short content hash of everything the image is built from.
+
+    Hashes file CONTENT rather than mtimes: a `git pull` or a fresh clone rewrites
+    mtimes without changing anything, and a needless rebuild here costs an apt
+    install plus catkin_make on a Jetson. Submodules contribute their commit id
+    instead of their contents, which is both cheaper and exactly as precise.
+    """
+    h = hashlib.sha256()
+    here = Path(__file__).resolve().parent
+    for name in IMAGE_SOURCES:
+        path = here / name
+        h.update(name.encode())
+        h.update(path.read_bytes() if path.is_file() else b"<missing>")
+    for sub in IMAGE_SUBMODULES:
+        h.update(sub.encode())
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(REPO_ROOT / sub), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            h.update(out.stdout.strip().encode() if out.returncode == 0 else b"<nogit>")
+        except Exception:
+            h.update(b"<nogit>")
+    return h.hexdigest()[:16]
+
+
+def image_label(tag: str) -> str | None:
+    """The fingerprint stamped into an existing image, or None if absent."""
+    result = subprocess.run(
+        ["docker", "image", "inspect", "-f",
+         f'{{{{index .Config.Labels "{FINGERPRINT_LABEL}"}}}}', tag],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value if value and value != "<no value>" else None
 
 
 def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -78,10 +134,12 @@ def image_exists(tag: str) -> bool:
     return result.returncode == 0
 
 
-def build_image(tag: str) -> None:
+def build_image(tag: str, fingerprint: str) -> None:
     print(f"[run_quest_relay] Building image '{tag}' (context: {REPO_ROOT})...")
     result = _run(
-        ["docker", "build", "-t", tag, "-f", str(DOCKERFILE), str(REPO_ROOT)],
+        ["docker", "build", "-t", tag,
+         "--label", f"{FINGERPRINT_LABEL}={fingerprint}",
+         "-f", str(DOCKERFILE), str(REPO_ROOT)],
     )
     if result.returncode != 0:
         sys.exit(f"[run_quest_relay] ERROR: docker build failed (exit {result.returncode}).")
@@ -206,12 +264,8 @@ def print_next_steps(args: argparse.Namespace) -> None:
     print("\n" + "=" * 72)
     print("[run_quest_relay] Relay is up.")
     if playing:
-        print(f"  - Replaying bag: {args.play_bag} (no Quest needed)")
-    else:
-        print(f"  - Point the Quest Unity app at:  <this-host>:{args.tcp_port}")
-        if getattr(args, "record_bag", None) is not None:
-            print(f"  - Recording a rosbag into: {args.record_bag}")
-            print("    Stop with Ctrl-C (NOT `docker kill`) so the bag is finalised.")
+        print(f"  - Bag mounted: {args.play_bag} (no Quest needed)")
+        print("  - The manager starts playback on its 2nd 's'.")
     print("  - Start the teleop manager with:")
     print(
         "      python -m teleop_manager.quest_manager "
@@ -354,18 +408,30 @@ def main() -> int:
 
     preflight()
 
+    fingerprint = image_fingerprint()
     have_image = image_exists(args.image_tag)
-    if args.rebuild or not have_image:
+    stale = have_image and image_label(args.image_tag) != fingerprint
+    if args.rebuild or not have_image or stale:
         if args.no_build:
             if not have_image:
                 sys.exit(
                     f"[run_quest_relay] ERROR: image '{args.image_tag}' not found and --no-build was given."
                 )
+            if stale:
+                print(
+                    "[run_quest_relay] WARNING: image is out of date with quest_bridge/ "
+                    "or the ROS submodules, but --no-build was given. Running it anyway."
+                )
         else:
-            build_image(args.image_tag)
+            if stale and not args.rebuild:
+                print(
+                    "[run_quest_relay] Image is out of date (quest_bridge sources or the "
+                    "ROS submodules changed since it was built) — rebuilding."
+                )
+            build_image(args.image_tag, fingerprint)
     else:
         print(
-            f"[run_quest_relay] Reusing existing image '{args.image_tag}' (pass --rebuild to force)."
+            f"[run_quest_relay] Reusing existing image '{args.image_tag}' (up to date)."
         )
 
     remove_stale_container(args.name)

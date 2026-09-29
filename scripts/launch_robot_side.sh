@@ -79,12 +79,26 @@ LATENCY_CSV="${LATENCY_CSV:-}"               # set to write a per-frame latency 
 MANAGER_EXTRA="${MANAGER_EXTRA---static-base}"   # arms/hands only by default: no walk, no
                                              # turn-in-place, no crouch. Relax deliberately,
                                              # e.g. MANAGER_EXTRA="--disable-walk" or ""
-TELEOP_VENV="${TELEOP_VENV:-$REPO/.venv_teleop}"
+# Prefer this repo's own venv, fall back to the GR00T checkout's: gear_sonic[teleop]
+# + brainco-retargeting is the manager's complete dependency set, and the launcher
+# cd's to $REPO before `python -m`, so this repo's packages import from the working
+# directory without being pip-installed. The resolved path is echoed at launch.
+if [ -z "${TELEOP_VENV:-}" ]; then
+    if [ -x "$REPO/.venv_teleop/bin/python" ]; then
+        TELEOP_VENV="$REPO/.venv_teleop"
+    elif [ -x "$GROOT_REPO/.venv_teleop/bin/python" ]; then
+        TELEOP_VENV="$GROOT_REPO/.venv_teleop"
+    else
+        TELEOP_VENV="$REPO/.venv_teleop"   # for the error message
+    fi
+fi
 SESSION="${SESSION:-g1_robot}"               # tmux session name
+RELAY_NAME="${RELAY_NAME:-quest-relay}"      # relay container name (bag trigger)
 
 # Config vars propagated into each tmux window (so exported overrides survive).
 CONFIG_VARS=(REPO GROOT_REPO ZMQ_HOST DEPLOY_TARGET OUTPUT_TYPE DEPLOY_EXTRA \
              ROBOT_IFACE HAND_DIR HAND_USE_SYSTEMD BAG_DIR PLAY_BAG BAG_LOOP \
+             RELAY_NAME \
              LATENCY_CSV MANAGER_EXTRA TELEOP_VENV SESSION)
 DEFAULT_COMPONENTS=(hand deploy relay manager)
 
@@ -262,11 +276,19 @@ run_single() {
                      --port 5556
                      --feedback-host localhost --feedback-port 5557)
             [ -n "$LATENCY_CSV" ] && mgr_cmd+=(--latency-csv "$LATENCY_CSV")
+            # Bag replay: the 2nd 's' starts the recording and calibrates on its
+            # first frame, so the bag plays out relative to the pose the 1st 's'
+            # ramped to. Until it starts, the relay is publishing all-zero
+            # defaults, which is why calibration cannot simply happen earlier.
+            [ -n "$PLAY_BAG" ] && mgr_cmd+=(--bag-trigger "docker exec $RELAY_NAME /start_bag.sh")
             if [ "$DRYRUN" -eq 0 ] && [ ! -x "$TELEOP_VENV/bin/python" ]; then
                 echo "ERROR: no teleop venv at $TELEOP_VENV" >&2
-                echo "       Create it: bash install_scripts/install_teleop.sh" >&2
+                echo "       Create it:  bash install_scripts/install_teleop.sh" >&2
+                echo "       Or reuse one, e.g. the GR00T checkout's:" >&2
+                echo "         TELEOP_VENV=$GROOT_REPO/.venv_teleop" >&2
                 exit 1
             fi
+            echo "# [robot:manager] venv: $TELEOP_VENV"
             # MANAGER_EXTRA is deliberately unquoted: it carries zero or more flags.
             run - "$REPO" "${mgr_cmd[@]}" $MANAGER_EXTRA
             ;;
@@ -349,11 +371,9 @@ Resolved config: GROOT_REPO=$GROOT_REPO
 Override any of these via env vars (see the config block at the top of this file).
 
 Driving the robot from a recording (no headset):
-  PLAY_BAG=~/bags/quest_20260929_120000.bag BAG_LOOP=1 $0
-The manager is NOT put in --no-robot here: the deploy is real, so you still get
-the normal two-press ramp from the robot's measured pose. Time the SECOND 's' to
-a moment when the recording is at the operator's rest pose — calibration samples
-whatever frame is playing, and rosbag play cannot be rewound by the manager.
+  PLAY_BAG=~/bags/quest_20260929_120000.bag $0
+  1st 's': ramp to the calibration pose.  2nd 's': start the recording, which is
+  calibrated against its own first frame and so plays out relative to that pose.
 Do NOT use the manager's --replay (NPZ) path on hardware: it skips the ramp.
 EOF
 }

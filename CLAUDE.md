@@ -108,9 +108,19 @@ point `--replay` at a live robot.
 One asymmetry to know: NPZ replay calls `source.restart()` when you calibrate, so
 playback and calibration are synchronised and `rest_hold_sec`/`rest_interp_sec`
 synthesise a rest prefix. **Bag playback cannot be rewound** — `rosbag play` is an
-external process the manager has no handle on — so calibration samples whatever
-frame happens to be playing. Time the second `s` to a rest-pose moment, and use
-`BAG_LOOP=1` so you get repeated chances.
+external process the manager has no handle on.
+
+Which is why bag playback is started **by the manager**, on its second `s`, via
+`--bag-trigger` (the launcher points it at `docker exec <relay> /start_bag.sh`).
+The recording's first frame is then what calibration reads, so the bag plays out
+relative to the pose the first `s` ramped to.
+
+Deferring calibration to that first frame is the point: `relay.py` publishes a
+snapshot every loop iteration whether or not a ROS message arrived, so before
+playback starts it is broadcasting head and wrists at the origin with identity
+rotations. Calibrating there would anchor the whole recording to a meaningless
+reference. The manager gates on `timestamp > 0.0`, which the relay only sets once
+a real message lands.
 
 ## Gotchas worth not rediscovering
 
@@ -137,6 +147,51 @@ condition actually cared about.
 **`MANAGER_EXTRA="${MANAGER_EXTRA---static-base}"` has no colon on purpose.** With
 `:-`, an explicitly empty value would silently re-apply the default; the launcher
 needs `MANAGER_EXTRA=""` to mean "full motion, no flags".
+
+**The relay image rebuilds on content change, not on tag absence.** `docker build`
+is only reached when the tag is missing, so an edited `entrypoint.sh` (which is
+COPY'd in) would otherwise sit unused behind an image that already exists.
+`run_quest_relay.py` hashes the five `quest_bridge/` files plus the two ROS
+submodule commits, stamps it as the `vr_teleop.fingerprint` label at build time,
+and rebuilds when it differs. It hashes content rather than mtimes because a
+`git pull` rewrites mtimes without changing anything, and a needless rebuild costs
+an apt install plus `catkin_make` on the Jetson.
+
+**Head translation is anchored at calibration whenever the base is pinned.**
+`QuestThreePointTracker.compute()` measures the wrist targets from the head
+position captured at calibration, not the live one, so
+`v(t) - v_cal = R0⁻¹(p_wrist(t) - p_wrist_cal)` — the targets depend only on how
+far the operator's *hands* have moved. Without it the head→wrist vector carries
+head motion into the arms: 30 cm of head translation moved them 21 cm at the
+default `pos_scale` 0.7, and the robot has no commandable neck to reproduce that
+motion with anyway. `--static-base` already removed the *rotation* half (it swaps
+the live heading frame for the fixed `R0`); only translation leaked, in every mode.
+
+It cannot be anchored once the base can **translate**: if the robot walks because
+the operator walked, the operator's wrists advanced too, so an absolute anchor
+would extend the targets by the distance walked instead of holding the hands in
+front of the chest. Hence locked under `--static-base` / `--disable-walk` only,
+which is the launcher default — but argparse's own default for `--static-base` is
+*off*, so a bare `python -m teleop_manager.quest_manager` is neither pinned nor
+locked. `--live-head-frame` restores the old head-relative form for A/B.
+
+Turning in place is orthogonal and unchanged: with a live heading frame
+(`--disable-walk`, facing still live) a body turn rotates the wrists about an axis
+through the head and `Rh(t)⁻¹` cancels it; under `--static-base` facing is pinned,
+the robot cannot turn, so the same body turn is just hand motion that the targets
+follow. Identical in both anchor modes.
+
+**The anchor relies on the Quest publishing wrist positions in the same fixed
+tracking frame as the head pose**, not relative to the head — which is what makes
+`p_wrist - p_head` meaningful in the first place. `relay.py` discards the `/tf`
+parent frame, so this is invisible in our code. The evidence is
+`generate_mock_quest_data.py`, whose constants were fitted to real recordings and
+put the head at z≈1.27 m with the wrists at z≈0.93 m (both floor-origin;
+head-relative wrists would sit near z≈−0.34), and
+`ReplaySource._build_rest_prefix`, which reconstructs a wrist the Quest *would*
+publish as `head_pos0 + r0.apply(...)`. If it were head-relative the anchor would
+achieve nothing, so it is worth confirming once on hardware — see the frame check in
+step 4 of `docs/TESTING_SCRIPT.md`.
 
 **`third_party/vr_haptic_msgs` builds under catkin directly.** Upstream is
 dual-build (`package.xml` format 3 with `condition="$ROS_VERSION == 1"`, and a

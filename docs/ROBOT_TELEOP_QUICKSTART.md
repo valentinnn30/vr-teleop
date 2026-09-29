@@ -80,6 +80,10 @@ and `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/hand_config.hpp` must
 have `#define USE_BRAINCO_HANDS 1` before the build, or the deploy ignores the
 hands entirely.
 
+After installing, work through **`TESTING_SCRIPT.md`** rather than jumping
+straight to the full stack — it brings the pieces up one at a time, and its first
+five steps cannot move the robot.
+
 ## Run
 
 ```bash
@@ -129,6 +133,30 @@ MANAGER_EXTRA=""                 # + walking
 MANAGER_EXTRA="--enable-crouch"  # + head-driven crouch (full motion)
 ```
 
+### Head anchor
+
+While the base cannot translate — the first two lines above — the wrist targets are
+measured from the head position captured at **calibration**, so moving your head
+does not move the arms. Only your hands do. The robot has no commandable neck, so
+head motion cannot be reproduced; before the anchor existed it leaked into the arms
+instead, 30 cm of head translation moving them 21 cm.
+
+Enabling walking (`MANAGER_EXTRA=""`) necessarily unlocks it: if the robot walks
+because you walked, your wrists advanced too, and an absolute anchor would extend
+the targets by the distance walked rather than holding your hands in front of your
+chest. The manager prints which form is live at startup and shows `anchor=locked` or
+`anchor=live` in its status line.
+
+A locked anchor no longer cancels *your own* drift, so if you wander from where you
+calibrated the status line says so — `anchor=locked drift 0.21m — press 'r' to
+re-anchor`. Tune the threshold with `--anchor-drift-warn` (default 0.15 m, `0` to
+silence it). `--live-head-frame` restores the old head-relative behaviour for an A/B
+on hardware:
+
+```
+MANAGER_EXTRA="--static-base --live-head-frame"
+```
+
 ### Env vars
 
 | Var | Default | |
@@ -142,6 +170,7 @@ MANAGER_EXTRA="--enable-crouch"  # + head-driven crouch (full motion)
 | `HAND_DIR` | this repo's build, else the GR00T one | use a specific hand-service build |
 | `TELEOP_VENV` | `.venv_teleop` | reuse another venv, e.g. `$GROOT_REPO/.venv_teleop` |
 | `PLAY_BAG` / `BAG_LOOP` | — | drive the robot from a recording, no headset |
+| `RELAY_NAME` | `quest-relay` | relay container name, used by the `play` subcommand |
 | `HAND_USE_SYSTEMD` | `0` | `1` = `systemctl restart brainco_hand.service` |
 
 ## Off-robot replay
@@ -155,10 +184,21 @@ BAG_DIR=$HOME/bags ./scripts/launch_robot_side.sh
 Stop the relay pane with **Ctrl-C, not `docker kill`** — `rosbag record` finalises
 its file only on SIGINT. A leftover `*.bag.active` means it was truncated.
 
+`rosbag` is ROS1 and lives only inside the relay image, not on the robot's host, so
+inspect a recording through the container:
+
+```bash
+docker run --rm -v ~/bags:/bags --entrypoint bash quest-relay -c \
+  'source /catkin_ws/devel/setup.bash && rosbag info /bags/*.bag'
+```
+
+Bags are written by the container as root. `sudo chown -R $USER: ~/bags` if that
+gets in the way.
+
 Then, on a laptop with no robot and no headset:
 
 ```bash
-./scripts/launch_replay.sh --bag ~/bags/quest_20260929_120000.bag [--loop]
+./scripts/launch_replay.sh --bag ~/bags/quest_<date_time>.bag [--loop]
 ```
 
 This replays the bag through the **real relay container**, so the relay, its
@@ -180,14 +220,21 @@ Useful as a repeatable hardware test: the bag supplies the ROS topics the Quest
 would have, so relay/msgpack/ZMQ stay in the loop and latency is representative.
 
 ```bash
-PLAY_BAG=~/bags/quest_20260929_120000.bag BAG_LOOP=1 ./scripts/launch_robot_side.sh
+PLAY_BAG=~/bags/quest_<date_time>.bag BAG_LOOP=1 ./scripts/launch_robot_side.sh
 ```
 
-The manager stays in **normal live mode** here — you still get the two-press ramp
-from the robot's measured pose, and the deploy is fully in the loop. Time the
-**second** `s` to a moment when the recording is at the operator's rest pose:
-calibration samples whatever frame is playing, and `rosbag play` cannot be rewound
-by the manager (`BAG_LOOP=1` gives you repeated chances).
+`PLAY_BAG` keeps the manager in **normal live mode** — the deploy is real, so you
+keep the ramp against measured joints:
+
+1. `y` at the deploy prompt.
+2. **`s`** — ramps the robot to the calibration pose.
+3. **`s`** again — starts the recording. Its first frame becomes the calibration
+   reference, so the bag plays out relative to the pose the robot just ramped to.
+
+That is the whole interaction. Calibration is deferred to the recording's first
+frame because until playback starts the relay is publishing its all-zero default
+snapshot, and anchoring to that would map the recording onto a meaningless
+reference.
 
 **Do not use `--replay` (NPZ) against a real robot.** It sets the manager offline,
 which skips the ramp — the robot would snap to the first commanded target from

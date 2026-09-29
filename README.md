@@ -12,7 +12,8 @@ bash install_scripts/install_teleop.sh
 ```
 
 Docs: `CLAUDE.md` (boundary, port map, gotchas), `docs/ROBOT_TELEOP_QUICKSTART.md`
-(setup/run), `docs/INTERFACE_CONTRACT.md` (the ZMQ contract with the GR00T repo).
+(setup/run), `docs/TESTING_SCRIPT.md` (post-install bring-up, in order),
+`docs/INTERFACE_CONTRACT.md` (the ZMQ contract with the GR00T repo).
 
 ## Layout
 

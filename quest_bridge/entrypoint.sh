@@ -74,23 +74,30 @@ done
 echo "[quest-relay] roscore up (PID $ROSCORE_PID)"
 
 if [ -n "$PLAY_BAG" ]; then
-    # ---- Bag playback (off-robot) --------------------------------------------
-    # No Quest connects in this mode, so the ros_tcp_endpoint is pointless; the
-    # bag supplies the same topics the endpoint would have published. The relay
-    # below is byte-for-byte the live one, so the manager cannot tell the
-    # difference — which is the whole point: it exercises the real relay rather
-    # than replaying at the manager's input the way --replay does.
+    # ---- Bag playback --------------------------------------------------------
+    # No Quest connects, so the ros_tcp_endpoint is pointless; the bag supplies
+    # the same topics it would have published. The relay is byte-for-byte the live
+    # one, so the manager cannot tell the difference.
+    #
+    # Playback is NOT started here. The manager kicks it off when teleop engages
+    # (its second 's') via /start_bag.sh, so the recording's first frame is the
+    # frame calibration reads — which is what makes the bag play out relative to
+    # the calibration pose instead of from an arbitrary mid-recording anchor.
     if [ ! -f "/bags/$PLAY_BAG" ]; then
         echo "[quest-relay] ERROR: /bags/$PLAY_BAG not found (is the bag mounted?)" >&2
         exit 1
     fi
     PLAY_ARGS=()
     [ -n "$BAG_LOOP" ] && PLAY_ARGS+=(--loop)
-    echo "[quest-relay] PLAY_BAG=$PLAY_BAG — replaying instead of starting the Quest endpoint"
-    rosbag play "${PLAY_ARGS[@]}" "/bags/$PLAY_BAG" &
-    BAG_PLAY_PID=$!
-    CHILD_PIDS+=("$BAG_PLAY_PID")
-    echo "[quest-relay] rosbag play started (PID $BAG_PLAY_PID)"
+    echo "[quest-relay] PLAY_BAG=$PLAY_BAG — the manager will start playback."
+
+    cat > /start_bag.sh <<PLAYER
+#!/bin/bash
+source /opt/ros/noetic/setup.bash
+source /catkin_ws/devel/setup.bash
+exec rosbag play ${PLAY_ARGS[*]} "/bags/$PLAY_BAG"
+PLAYER
+    chmod +x /start_bag.sh
 else
     # ---- Live Quest ----------------------------------------------------------
     # Start ros_tcp_endpoint in background (bridges Quest Unity TCP → ROS1 topics).

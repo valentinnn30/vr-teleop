@@ -5,3 +5,6 @@ __pycache__/
 outputs/
 *.npz
 .DS_Store
+
+# Claude Code local state (incl. git worktrees it creates)
+.claude/
